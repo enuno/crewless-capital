@@ -1,9 +1,10 @@
 # Crewless Capital — System Specification
 
-**Version:** 2.0.0-draft  
-**Last Updated:** 2026-04-13  
-**Status:** Active development — research / paper trading target  
+**Version:** 2.1.0-draft
+**Last Updated:** 2026-04-13
+**Status:** Active development — research / paper trading target
 **Repo:** https://github.com/enuno/crewless-capital
+**Changelog:** v2.1.0 — closes all open architectural questions: wallet provider (ERC-4337 + Safe), oracle stack (Pyth/Chainlink/TWAP), bridge policy, LLM redundancy strategy, CIO agent v2 design.
 
 ---
 
@@ -276,6 +277,76 @@ Departments move between defined capital tiers. All transitions are explicit gov
 | `PAUSED` | Temporarily halted; capital returned to treasury |
 | `SUNSETTING` | Winding down; positions being closed |
 
+### 5.4 CIO Agent — Model-Assisted Scoring (v2)
+
+The CIO agent is the highest-stakes LLM in the system. It operates in two mandatory stages to prevent unconstrained model output from influencing capital allocation.
+
+#### Stage 1 — Deterministic Pre-Filter (no LLM)
+
+Before the CIO model is invoked, the Policy Engine removes all departments that fail hard eligibility rules. A department is ineligible if any of the following are true:
+
+- `DepartmentStatus.state` is `PAUSED`, `SUNSETTING`, or `UNFUNDED`
+- Active circuit breaker flag on the department
+- Unresolved reconciliation drift event
+- Stale data flag (`stale_data_incident` within last 2 cycles)
+- `operational_health_score < 0.70`
+
+The CIO model only receives the post-filter candidate set. It cannot override the pre-filter.
+
+#### Stage 2 — Model-Assisted Scoring
+
+The CIO agent receives a fully structured `AllocationScoringInput` JSON artifact:
+
+```json
+{
+  "firm_meta": { "cycle_id": "...", "firm_mode": "SHADOW", "policy_version": "1.4.2" },
+  "regime_id": "RANGING_LOW_VOL",
+  "strategic_priority_id": "DEFENSIVE_YIELD",
+  "current_firm_nav_usd": 500000,
+  "current_allocations": [ { "department_id": "treasury-yield", "nav_usd": 50000 } ],
+  "candidate_departments": [
+    {
+      "department_id": "treasury-yield",
+      "rolling_sharpe": 1.2,
+      "rolling_sortino": 1.5,
+      "rolling_calmar": 2.1,
+      "rolling_max_drawdown_pct": 3.1,
+      "regime_fit_score": 0.91,
+      "liquidity_fit_score": 0.87,
+      "operational_health_score": 0.98,
+      "correlation_to_firm": 0.12,
+      "capital_utilization_pct": 0.72
+    }
+  ]
+}
+```
+
+The model must return a typed `AllocationRationale` artifact containing:
+
+- Numeric score per department per scoring dimension (§5.2)
+- Proposed `DepartmentBudget` changes with explicit numeric justification
+- Any departments recommended for promotion or demotion with rationale
+- Confidence level in the allocation decision (`LOW` / `MEDIUM` / `HIGH`)
+- Explicit acknowledgment of the regime and strategic priority constraints applied
+- Any proposed changes the model cannot justify numerically must be flagged as `UNSUBSTANTIATED` and are automatically rejected by the post-check
+
+#### Stage 3 — Deterministic Post-Check (no LLM)
+
+After the model returns its `AllocationRationale`, the Policy Engine applies a final deterministic validation:
+
+- Total proposed allocation must not exceed firm NAV cap
+- No allocation to any pre-filtered department (model cannot override Stage 1)
+- No allocation change may breach CRO exposure caps
+- If CIO proposal conflicts with CRO constraint, CRO wins — unconditionally
+- `UNSUBSTANTIATED` flags cause the associated budget change to be rejected; remaining valid changes proceed
+- All inputs, outputs, overrides, and post-check results are included in the `DecisionTrace`
+
+#### CIO Prompt Policy Rules
+
+- Versioned in `packages/prompt-policies/cio/`
+- Changes require a promotion gate governance event — no hot-patching
+- The prompt explicitly instructs the model: it cannot modify the protocol allowlist, wallet authority, or safety layer; it cannot access data not present in the input artifact; it must cite specific metric values from the input for every proposed change
+
 ---
 
 ## 6. Risk and Safety Architecture
@@ -288,15 +359,27 @@ The Firm Safety Layer is deterministic. It is non-bypassable by any agent, opera
 - Department drawdown threshold
 - Gross and net exposure caps (firm and per-department)
 - Per-chain and per-protocol concentration caps
-- Bridge and settlement caps
+- Bridge and settlement caps (see §7.4)
 - Stablecoin issuer concentration
 - Wallet daily spend caps
 - Stale state and reconciliation drift detection
-- Oracle sanity bounds
+- Oracle sanity bounds (see below)
 - Slippage and liquidity gates
 - Protocol allowlist enforcement
 - Post-incident cooldown periods
 - Protocol / chain stress condition detection
+
+#### Oracle Sanity Bounds (deterministic checks)
+
+All price data must pass the following deterministic checks before being used in any decision. Failure triggers a `stale_data_incident` and blocks the cycle:
+
+| Check | Condition | Action on Failure |
+|---|---|---|
+| Pyth confidence interval | `conf / price > 0.5%` | Block cycle; log stale_data_incident |
+| Pyth–Chainlink price divergence | `abs(pyth_price - chainlink_price) / pyth_price > 1%` | Block cycle; log stale_data_incident |
+| TWAP deviation from spot | TWAP diverges from Pyth spot by `> 2%` over 15-min window | Flag for CRO review; do not block unless `> 5%` |
+| Heartbeat staleness | Chainlink feed not updated within its documented heartbeat × 1.5 | Demote Chainlink to tertiary; rely on Pyth only |
+| Oracle source disagreement (3-way) | Pyth + Chainlink + TWAP all diverge by `> 1%` from each other | Full block; enter data recovery mode |
 
 ### 6.2 Risk Profiles
 
@@ -312,23 +395,34 @@ The existing aggressive / neutral / conservative risk committee pattern from pri
 | Reconciliation drift detected | Halt affected department, trigger reconciliation job |
 | Protocol exploit detected | Remove from allowlist, trigger unwind if exposed |
 | Wallet policy violation attempt | Block tx, log governance breach, alert |
+| Bridge exploit on allowlisted bridge | Immediately suspend all bridge operations; pause bridge wallet grants |
 
 ---
 
 ## 7. Wallet Authority Model
 
-Self-custody is a constitutional invariant. Wallet architecture must enforce authority boundaries programmatically, not by convention.
+Self-custody is a constitutional invariant. Wallet architecture enforces authority boundaries programmatically via on-chain smart account policy, not by convention or database-only enforcement.
 
 ### 7.1 Wallet Classes
 
-| Class | Purpose | Who Controls |
-|---|---|---|
-| Master Treasury Vault | Reserve capital and strategic liquidity | Executive + policy gate; no department direct access |
-| Department Hot Wallet | Production execution within budget | Department, bounded by grant: chain, protocol, daily limit |
-| Settlement / Bridge Wallet | Interchain transfers and settlement | Separate grant; no speculative trading permitted |
-| Research / Paper Wallet | Simulation and low-risk test operations | No access to production treasury |
-| Yield Wallet | Treasury deployment into approved yield protocols | Treasury mandate only |
-| Recovery Wallet | Emergency unwind / break-glass actions | Special governance path with human approval gate |
+Each wallet class uses a specific on-chain account type. The internal `WalletPolicyService` issues grants bounded by these on-chain constraints — the on-chain policy is the enforcement layer; the service is the coordination layer.
+
+| Class | Purpose | Account Type | Signing Model | Who Controls |
+|---|---|---|---|---|
+| Master Treasury Vault | Reserve capital and strategic liquidity | Safe{Wallet} (M-of-N multisig) | 2-of-3 HSM-backed signers + human operator key | Executive + policy gate; no department direct access |
+| Department Hot Wallet | Production execution within budget | ERC-4337 smart account (Kernel / Biconomy Nexus) | Session key per `WalletAuthorityGrant`; revocable, scoped, time-bounded | Department, bounded by grant: chain, protocol, daily limit |
+| Settlement / Bridge Wallet | Interchain transfers and settlement | ERC-4337 smart account | Session key scoped to bridge allowlist + source/destination chain pair only | Separate grant; no speculative trading permitted |
+| Research / Paper Wallet | Simulation and low-risk test operations | Standard EOA (simulated) | No production signing; simulation only | No access to production treasury |
+| Yield Wallet | Treasury deployment into approved yield protocols | ERC-4337 smart account | Session key scoped to yield protocol allowlist only | Treasury mandate only |
+| Recovery Wallet | Emergency unwind / break-glass actions | Safe{Wallet} (2-of-3, cold) | Cold hardware keys; no hot path access | Special governance path with human approval gate |
+
+#### Smart Account Implementation Notes
+
+- **ERC-4337 framework:** [Kernel (ZeroDev)](https://github.com/zerodevapp/kernel) is the primary smart account implementation. [Biconomy Nexus](https://github.com/bcnmy/nexus) is the alternative/fallback.
+- **Session key modules:** ERC-7579-compatible session key modules scope each `WalletAuthorityGrant` to: target contract(s), allowed method selectors, spend limit, and `validUntil` timestamp. A `WalletAuthorityGrant` in the internal database is always backed by a corresponding on-chain session key with matching constraints.
+- **Safe framework:** [Safe{Core} SDK](https://github.com/safe-global/safe-core-sdk) and [Safe Transaction Service](https://github.com/safe-global/safe-transaction-service) are used for all Safe wallet operations. The Master Treasury Vault and Recovery Wallet are Safe smart accounts.
+- **Chain coverage:** ERC-4337 and Safe are both deployed on Ethereum, Arbitrum, Base, and Optimism. Solana uses a native smart wallet abstraction (e.g., Squads multisig for treasury; program-derived authority for hot wallets). HyperLiquid uses its native vault/sub-account model for the HyperLiquid execution rail only.
+- **Paymaster:** ERC-4337 paymasters are used for gas sponsorship on department hot wallets to simplify gas management across chains. The Wallet Policy Service manages paymaster policy.
 
 ### 7.2 Authority Stack
 
@@ -336,10 +430,11 @@ Every execution intent traverses this stack in order. No step can be skipped:
 
 ```
 Intent
- → Department budget envelope check
- → Firm-wide risk engine check
- → Wallet authority grant check
- → Protocol allowlist check
+ → Department budget envelope check           [Allocation Engine]
+ → Firm-wide risk engine check                [Firm Risk Core — deterministic]
+ → Wallet authority grant check               [Wallet Policy Service — deterministic]
+ → Protocol allowlist check                   [Policy Engine — deterministic]
+ → On-chain session key validation            [Smart account — enforced on-chain]
  → Transaction builder
  → Signer / smart-account policy
  → Broadcast
@@ -351,9 +446,48 @@ Intent
 
 - Departments never control master treasury vault keys directly.
 - Wallets are bound to a specific department, chain, and protocol allowlist.
+- Session keys are issued per `WalletAuthorityGrant`; grant constraints are mirrored on-chain in the session key module.
 - High-risk actions (bridging, new protocol access, large treasury conversions, leverage changes) require escalated policy and may require human approval.
-- Session grants expire and are revocable; all transactions carry a `grant_id` and `trace_id`.
+- Session grants expire (`validUntil`) and are revocable; all transactions carry a `grant_id` and `trace_id`.
 - The Wallet Policy Service is deterministic; it does not use LLM reasoning.
+- Grant issuance, use, expiry, and revocation are all persisted to the `wallet_authority_grants` table and emitted as governance events.
+
+### 7.4 Bridge Policy
+
+Bridge operations are the highest-risk adapter class and are subject to separate, stricter policy constraints enforced by the Policy Engine before any bridge action is permitted.
+
+#### Bridge Allowlist
+
+Only explicitly allowlisted bridges may be used. Additions require a human-approved governance event. The initial allowlist:
+
+| Bridge | Rationale | Chains |
+|---|---|---|
+| Across Protocol | Optimistic, fast, audited, canonical for EVM↔EVM | Ethereum, Arbitrum, Base, Optimism |
+| Stargate (LayerZero) | Wide chain coverage, deep liquidity | Ethereum, Arbitrum, Base, Solana |
+| Wormhole NTT | Best-in-class for Solana↔EVM canonical transfers | Solana ↔ Ethereum, Arbitrum, Base |
+
+All other bridges are blocked by default.
+
+#### Bridge Risk Constraints (deterministic — enforced by Policy Engine)
+
+| Constraint | Value | Notes |
+|---|---|---|
+| Max in-flight per bridge | 5% of firm NAV | Total value currently in transit per bridge |
+| Max single bridge transaction | 2% of firm NAV | Per transaction hard cap |
+| Bridge wallet daily cap | 8% of firm NAV | Aggregate across all bridges per day |
+| Minimum bridge TVL | $500M | Bridge must meet TVL threshold at time of use |
+| Max audit age | 18 months | Most recent full audit must be within 18 months |
+| Confirmation window | Full destination confirmation required | Bridged capital is `PENDING` until destination confirms; not tradeable |
+| Bridge exploit detection | Real-time monitoring via on-chain watchlist | All bridge ops suspended on any anomaly |
+| Destination chain scope | Grant scoped to source + destination pair | Routing changes mid-flight not permitted |
+
+#### Bridge Settlement Wallet Grant
+
+A bridge action requires a `WalletAuthorityGrant` on the Settlement/Bridge Wallet class with:
+- `allowed_actions: [BRIDGE_SEND]`
+- `allowed_protocols: [<specific bridge id>]`
+- Explicit `source_chain_id` and `destination_chain_id` in grant metadata
+- `requires_human_approval: true` for amounts exceeding 1% of firm NAV
 
 ---
 
@@ -396,11 +530,18 @@ enum AssetDomain {
 }
 
 enum RiskVerdict {
-  RISK_VERDICT_UNSPECIFIED = 0;
-  APPROVE                  = 1;
+  RISK_VERDICT_UNSPECIFIED  = 0;
+  APPROVE                   = 1;
   APPROVE_WITH_MODIFICATION = 2;
-  REJECT                   = 3;
-  ESCALATE                 = 4;
+  REJECT                    = 3;
+  ESCALATE                  = 4;
+}
+
+enum AllocationConfidence {
+  ALLOCATION_CONFIDENCE_UNSPECIFIED = 0;
+  LOW                               = 1;
+  MEDIUM                            = 2;
+  HIGH                              = 3;
 }
 ```
 
@@ -416,6 +557,7 @@ message FirmMeta {
   int64  created_at_ms       = 6;
   string operator_identity   = 7;
   FirmMode firm_mode         = 8;
+  string model_tier_used     = 9;   // populated when LLM substitution occurs (see §12)
 }
 ```
 
@@ -423,23 +565,24 @@ message FirmMeta {
 
 ```protobuf
 message DepartmentStatus {
-  FirmMeta       meta                    = 1;
-  string         department_id           = 2;
-  string         mandate_id              = 3;
-  DepartmentState state                  = 4;
-  double         assigned_nav_usd        = 5;
-  double         utilized_nav_usd        = 6;
-  double         gross_exposure_usd      = 7;
-  double         net_exposure_usd        = 8;
-  double         rolling_sharpe          = 9;
-  double         rolling_sortino         = 10;
-  double         rolling_calmar          = 11;
-  double         rolling_max_drawdown_pct = 12;
-  double         regime_fit_score        = 13;
-  double         liquidity_fit_score     = 14;
-  double         operational_health_score = 15;
-  double         correlation_to_firm     = 16;
-  repeated string active_risks           = 17;
+  FirmMeta        meta                     = 1;
+  string          department_id            = 2;
+  string          mandate_id               = 3;
+  DepartmentState state                    = 4;
+  double          assigned_nav_usd         = 5;
+  double          utilized_nav_usd         = 6;
+  double          gross_exposure_usd       = 7;
+  double          net_exposure_usd         = 8;
+  double          rolling_sharpe           = 9;
+  double          rolling_sortino          = 10;
+  double          rolling_calmar           = 11;
+  double          rolling_max_drawdown_pct = 12;
+  double          regime_fit_score         = 13;
+  double          liquidity_fit_score      = 14;
+  double          operational_health_score = 15;
+  double          correlation_to_firm      = 16;
+  repeated string active_risks             = 17;
+  double          capital_utilization_pct  = 18;
 }
 ```
 
@@ -474,24 +617,36 @@ message DepartmentIntentSet {
 
 ```protobuf
 message DepartmentBudget {
-  string          department_id        = 1;
-  DepartmentState target_state         = 2;
-  double          target_nav_usd       = 3;
+  string          department_id          = 1;
+  DepartmentState target_state           = 2;
+  double          target_nav_usd         = 3;
   double          max_gross_exposure_usd = 4;
-  double          max_net_exposure_usd = 5;
-  double          max_drawdown_pct     = 6;
-  string          rationale            = 7;
+  double          max_net_exposure_usd   = 5;
+  double          max_drawdown_pct       = 6;
+  string          rationale              = 7;
+}
+
+message AllocationRationale {
+  FirmMeta             meta                     = 1;
+  string               regime_id                = 2;
+  string               strategic_priority_id    = 3;
+  AllocationConfidence confidence               = 4;
+  repeated string      dimension_scores         = 5;  // serialized per-dept per-dimension scores
+  repeated string      unsubstantiated_flags    = 6;  // budget changes rejected for lack of numeric justification
+  string               cio_reasoning            = 7;
 }
 
 message CapitalAllocationDecision {
-  FirmMeta meta                         = 1;
-  string   regime_id                    = 2;
-  string   strategic_priority_id        = 3;
-  repeated DepartmentBudget budgets     = 4;
-  repeated string paused_departments    = 5;
-  repeated string promoted_departments  = 6;
-  repeated string demoted_departments   = 7;
-  string   allocator_rationale          = 8;
+  FirmMeta             meta                      = 1;
+  string               regime_id                 = 2;
+  string               strategic_priority_id     = 3;
+  repeated DepartmentBudget budgets              = 4;
+  repeated string      paused_departments        = 5;
+  repeated string      promoted_departments      = 6;
+  repeated string      demoted_departments       = 7;
+  string               allocator_rationale       = 8;
+  AllocationRationale  cio_rationale             = 9;
+  repeated string      cro_overrides             = 10; // budget changes rejected by CRO post-check
 }
 ```
 
@@ -499,18 +654,22 @@ message CapitalAllocationDecision {
 
 ```protobuf
 message WalletAuthorityGrant {
-  FirmMeta meta                       = 1;
-  string   grant_id                   = 2;
-  string   wallet_id                  = 3;
-  string   department_id              = 4;
-  string   chain_id                   = 5;
-  repeated string allowed_protocols   = 6;
-  repeated string allowed_actions     = 7;
-  double   max_tx_usd                 = 8;
-  double   max_daily_usd              = 9;
-  bool     requires_multisig          = 10;
-  bool     requires_human_approval    = 11;
-  int64    expires_at_ms              = 12;
+  FirmMeta        meta                    = 1;
+  string          grant_id                = 2;
+  string          wallet_id               = 3;
+  string          wallet_class            = 4;  // DEPT_HOT, SETTLEMENT, YIELD, RECOVERY, etc.
+  string          department_id           = 5;
+  string          chain_id                = 6;
+  repeated string allowed_protocols       = 7;
+  repeated string allowed_actions         = 8;
+  double          max_tx_usd              = 9;
+  double          max_daily_usd           = 10;
+  bool            requires_multisig       = 11;
+  bool            requires_human_approval = 12;
+  int64           expires_at_ms           = 13;
+  string          session_key_id          = 14; // on-chain session key backing this grant
+  string          source_chain_id         = 15; // bridge grants only
+  string          destination_chain_id    = 16; // bridge grants only
 }
 ```
 
@@ -518,33 +677,34 @@ message WalletAuthorityGrant {
 
 ```protobuf
 message OnchainAction {
-  string chain_id        = 1;
-  string protocol_id     = 2;
-  string action_type     = 3;
-  string input_asset     = 4;
-  string output_asset    = 5;
-  double amount_usd      = 6;
+  string chain_id         = 1;
+  string protocol_id      = 2;
+  string action_type      = 3;
+  string input_asset      = 4;
+  string output_asset     = 5;
+  double amount_usd       = 6;
   double max_slippage_bps = 7;
-  bool   reduce_only     = 8;
+  bool   reduce_only      = 8;
 }
 
 message ExecutionPlan {
-  FirmMeta meta                       = 1;
-  string   department_id              = 2;
-  string   wallet_id                  = 3;
-  string   grant_id                   = 4;
-  repeated OnchainAction actions      = 5;
-  string   plan_hash                  = 6;
+  FirmMeta             meta          = 1;
+  string               department_id = 2;
+  string               wallet_id     = 3;
+  string               grant_id      = 4;
+  string               session_key_id = 5;
+  repeated OnchainAction actions     = 6;
+  string               plan_hash     = 7;
 }
 
 message FirmExecutionDecision {
-  FirmMeta meta                          = 1;
-  bool     allowed                       = 2;
-  repeated string checks_passed         = 3;
-  repeated string checks_failed         = 4;
-  repeated ExecutionPlan staged_plans   = 5;
-  string   rejection_reason             = 6;
-  RiskVerdict verdict                   = 7;
+  FirmMeta             meta              = 1;
+  bool                 allowed           = 2;
+  repeated string      checks_passed     = 3;
+  repeated string      checks_failed     = 4;
+  repeated ExecutionPlan staged_plans    = 5;
+  string               rejection_reason  = 6;
+  RiskVerdict          verdict           = 7;
 }
 ```
 
@@ -563,6 +723,7 @@ message DecisionTrace {
   string                    final_state       = 9;
   repeated string           halt_flags        = 10;
   int64                     latency_ms        = 11;
+  repeated string           model_substitutions = 12; // populated when failover model used
 }
 ```
 
@@ -640,10 +801,14 @@ crewless-capital/
 │   ├── lending/
 │   ├── staking/
 │   └── bridges/
+│       ├── across/
+│       ├── stargate/
+│       └── wormhole-ntt/
 │
 ├── packages/
 │   ├── schemas/                     ← Generated JSON schemas from proto
 │   ├── prompt-policies/             ← Versioned prompt templates (off-path only)
+│   │   └── cio/                     ← CIO agent prompt policy (versioned; promotion gate required)
 │   ├── strategy-sdk/                ← Plugin API for department strategy modules
 │   ├── wallet-policies/             ← Wallet authority rule definitions
 │   ├── governance-rules/            ← HITL and promotion rulesets
@@ -654,8 +819,9 @@ crewless-capital/
 │   ├── policies/                    ← Firm policy YAML files
 │   ├── departments/                 ← Per-department configuration
 │   ├── mandates/                    ← Investment mandate definitions
-│   ├── chains/                      ← Chain configuration
+│   ├── chains/                      ← Chain configuration + oracle assignments
 │   ├── protocols/                   ← Protocol allowlist and metadata
+│   ├── bridges/                     ← Bridge allowlist and risk parameters
 │   └── wallets/                     ← Wallet class and authority definitions
 │
 ├── infra/
@@ -670,6 +836,8 @@ crewless-capital/
 │   ├── protobuf.md
 │   ├── department-guide.md
 │   ├── wallet-authority.md
+│   ├── oracle-policy.md
+│   ├── bridge-policy.md
 │   └── runbooks/
 │
 └── tests/
@@ -695,6 +863,7 @@ All decisions, policies, approvals, prompts, and governance state are persisted 
 | `department_status_snapshots` | Per-cycle DepartmentStatus snapshots |
 | `allocation_cycles` | Executive allocation cycle metadata |
 | `allocation_decisions` | CapitalAllocationDecision per cycle |
+| `cio_rationales` | AllocationRationale artifacts (CIO model output + post-check results) |
 | `department_intents` | DepartmentIntentSet per cycle per department |
 | `execution_plans` | ExecutionPlan proposals and outcomes |
 | `wallet_authority_grants` | Grant lifecycle: issued, used, expired, revoked |
@@ -712,14 +881,26 @@ All decisions, policies, approvals, prompts, and governance state are persisted 
 | `hitl_rulesets` | Human-in-the-loop gate configurations |
 | `human_approvals` | Human approval records |
 | `recovery_state` | Incident recovery state machine |
+| `oracle_incidents` | Stale data, divergence, and sanity bound failures |
+| `bridge_operations` | Bridge transaction lifecycle: initiated, in-flight, confirmed, failed |
+| `model_substitution_events` | LLM provider failover events per cycle per task class |
 
 ### 10.2 Other Storage
 
 | Store | Purpose |
 |---|---|
+| TimescaleDB | Time-series market data, OHLCV, funding rates, oracle prices, on-chain metrics |
+| Supermemory.ai | Per-agent semantic memory via `containerTags`; RAG for research knowledge base |
 | MLflow | Experiment tracking, backtest metadata, model evaluation |
 | Object storage (S3-compatible) | Large artifacts: backtest outputs, archived traces |
 | Redis / NATS | Transient coordination, event bus (non-durable) |
+
+#### Memory Separation Policy
+
+- **Hard trading state** (positions, fills, PnL, wallet balances, execution decisions) → Postgres + TimescaleDB only. Never stored in Supermemory.
+- **Semantic narratives** (agent reflections, strategy reasoning summaries, regime observations, debate outcomes as narrative) → Supermemory per-agent `containerTag`.
+- **Research documents and knowledge base** → Supermemory RAG (OpenClaw / research bridge integration).
+- Raw market data and oracle prices → TimescaleDB only.
 
 ---
 
@@ -729,9 +910,9 @@ Metrics are split into three classes:
 
 **Trading metrics:** Sharpe, Sortino, Calmar, max drawdown, win rate, expectancy, profit factor, slippage, fee burden, exposure utilization.
 
-**Process metrics:** Cycle latency, debate duration, allocation latency, veto frequency, no-trade frequency, department promotion rate.
+**Process metrics:** Cycle latency, debate duration, allocation latency, veto frequency, no-trade frequency, department promotion rate, model substitution rate per task class.
 
-**Safety metrics:** Stale data incidents, policy rejects, wallet authority violations, recovery entries, manual override counts, circuit breaker triggers.
+**Safety metrics:** Stale data incidents, oracle divergence events, policy rejects, wallet authority violations, recovery entries, manual override counts, circuit breaker triggers, bridge operation status, reconciliation drift events.
 
 ---
 
@@ -739,17 +920,44 @@ Metrics are split into three classes:
 
 LLMs are used only where probabilistic reasoning adds value. All safety-critical, authority, and policy enforcement is deterministic.
 
-| Pipeline Stage | Model Tier | Rationale |
-|---|---|---|
-| Data normalization, entity extraction | Fast / cheap (GPT-4o-mini, Haiku) | High volume, low reasoning requirement |
-| Analyst synthesis | Mid-tier (GPT-4o, Sonnet) | Domain reasoning on structured inputs |
-| Bull/bear debate rounds | Strong reasoning (o3, Opus) | Adversarial argument quality matters |
-| Trader synthesis | Strong reasoning | Final intent formulation |
-| Risk committee profiles | Mid-tier (parallel, 3 profiles) | Profile evaluation on structured risk inputs |
-| Department portfolio agent | Strong reasoning | Portfolio-level constraint enforcement |
-| CIO allocator scoring | Strong reasoning | Capital allocation rationale |
-| SAE / Firm Safety Layer | **Deterministic rule engine** | No LLM — hard policy only |
-| Wallet Policy Service | **Deterministic rule engine** | No LLM — authority enforcement only |
+### 12.1 Provider Assignment and Failover
+
+Each task class has a primary provider, a failover provider, and a tertiary. The `packages/model-routing/` package implements this table and enforces live-mode tier minimums.
+
+| Task Class | Primary | Failover | Tertiary | Live-Mode Minimum Tier |
+|---|---|---|---|---|
+| Data normalization / entity extraction | GPT-4o-mini | Gemini Flash 2.0 | Claude Haiku 3.5 | Fast |
+| Analyst synthesis | GPT-4o | Claude Sonnet 4.5 | Gemini Pro 2.0 | Mid |
+| Bull/bear debate rounds | o3 | Claude Opus 4 | Gemini Ultra 2.0 | Strong reasoning |
+| Trader synthesis | o3 | Claude Opus 4 | Gemini Ultra 2.0 | Strong reasoning |
+| Risk committee profiles (×3 parallel) | GPT-4o | Claude Sonnet 4.5 | Gemini Pro 2.0 | Mid |
+| Department portfolio agent | o3 | Claude Sonnet 4.5 | — | Mid (live); Strong (full capital) |
+| CIO allocator scoring (v2) | o3 | Claude Opus 4 | — | Strong reasoning |
+| SAE / Firm Safety Layer | **Deterministic rule engine** | — | — | No LLM |
+| Wallet Policy Service | **Deterministic rule engine** | — | — | No LLM |
+
+### 12.2 Failover Rules
+
+1. **Trigger conditions for failover:** Provider returns an error, timeout (fast tier: >15s; mid tier: >60s; strong reasoning tier: >180s), or a response that fails JSON schema validation against the expected typed artifact.
+2. **Schema validation gates failover:** A structurally invalid artifact (failed protobuf/JSON schema) counts as a failure and triggers failover — not only network errors.
+3. **Provider health tracking:** The model router maintains a rolling 10-cycle health score per provider per task class. A provider with >20% failure rate in the rolling window is temporarily demoted to tertiary. Health score is logged to `model_substitution_events`.
+4. **Budget-aware substitution:** If the primary reasoning provider is degraded, the router may downgrade to a mid-tier model and populates `FirmMeta.model_tier_used` in the artifact with the substituted tier identifier.
+5. **Live-mode tier minimums are hard:** In live mode (`FirmMode.LIVE`), if no provider meets the minimum tier for a given task class, the cycle emits `HOLD_FLAT` for all affected departments and logs a `policy_reject`. Execution does not proceed on a degraded model below minimum tier.
+6. **Paper and shadow mode tolerance:** In `PAPER` and `SHADOW` modes, downgraded models are acceptable and do not block cycles. Substitution events are still logged.
+7. **No failover for deterministic services:** The Policy Engine and Wallet Policy Service are deterministic — they have no LLM failover path. If they are unavailable, execution halts and a circuit breaker fires.
+8. **Audit trail:** Every substitution (primary → failover → tertiary) is logged in `model_substitution_events` with the task class, original provider, substituted provider, failure reason, and cycle ID. Substitutions are included in the `DecisionTrace.model_substitutions` field.
+
+### 12.3 Per-Chain Oracle Assignment
+
+| Chain | Primary Oracle | Secondary / Fallback | Tertiary Sanity Check |
+|---|---|---|---|
+| Ethereum | Pyth Network (pull) | Chainlink (push) | DEX TWAP (Uniswap V3 30-min) |
+| Arbitrum | Pyth Network (pull) | Chainlink (push) | DEX TWAP (Uniswap V3 / Camelot) |
+| Base | Pyth Network (pull) | Chainlink (push) | DEX TWAP (Aerodrome) |
+| Solana | Pyth Network (native) | Switchboard | DEX TWAP (Orca / Raydium) |
+| HyperLiquid | HyperLiquid native oracle | Pyth Network (via EVM bridge) | — |
+
+Oracle resolution order per price request: Pyth primary → validate against Chainlink heartbeat → TWAP sanity check → apply oracle sanity bounds from §6.1 → pass to pipeline or trigger stale_data_incident.
 
 ---
 
@@ -764,6 +972,7 @@ LLMs are used only where probabilistic reasoning adds value. All safety-critical
 5. **Research, paper, and live environments are strictly separated.** No cross-environment data flow without explicit promotion gate.
 6. **Least-privilege API keys and wallet grants.** Read-only keys for research; restricted, session-bounded grants for execution.
 7. **Secrets management.** No hardcoded credentials. Secrets via secret manager or controlled env vars, never committed.
+8. **On-chain enforcement over database-only enforcement.** Where feasible, wallet authority constraints are enforced by on-chain session key scope — not only by the Wallet Policy Service database.
 
 ### 13.2 Language Defaults
 
@@ -805,7 +1014,7 @@ To avoid over-engineering before validation, the initial v2 production target is
 - Treasury & Yield (limited capital from day one)
 
 **Executive layer:**
-- CIO Allocator (rules-based first, then model-assisted)
+- CIO Allocator (rules-based v1 first, then model-assisted v2 per §5.4)
 - CRO Risk (deterministic)
 - Treasury Agent
 - Wallet Policy Service

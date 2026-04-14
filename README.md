@@ -1,4 +1,4 @@
-<![CDATA[<p align="center">
+<p align="center">
   <img src="assets/crewless-capital-logo.png" alt="Crewless Capital" width="420"/>
 </p>
 
@@ -147,4 +147,3 @@ MIT — see [LICENSE](LICENSE) for details.
 <p align="center">
   <em>Built by machines. Governed by code. Owned by no one but the keyholder.</em>
 </p>
-]]>

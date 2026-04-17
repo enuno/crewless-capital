@@ -1,0 +1,30 @@
+wing: crewless_capital
+rooms:
+- name: migrate_hyperliquid_firm
+  description: Files from migrate-hyperliquid-firm/
+  keywords:
+  - migrate_hyperliquid_firm
+  - migrate-hyperliquid-firm
+- name: design
+  description: Files from assets/
+  keywords:
+  - design
+  - assets
+- name: configuration
+  description: Files from infra/
+  keywords:
+  - configuration
+  - infra
+- name: testing
+  description: Files from tests/
+  keywords:
+  - testing
+  - tests
+- name: documentation
+  description: Files from docs/
+  keywords:
+  - documentation
+  - docs
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []
